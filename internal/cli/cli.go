@@ -9,6 +9,7 @@ import (
 
 	"github.com/docker/cli/cli/streams"
 	"github.com/psviderski/uncloud/internal/cli/config"
+	"github.com/psviderski/uncloud/internal/fs"
 	"github.com/psviderski/uncloud/internal/machine"
 	"github.com/psviderski/uncloud/internal/machine/api/pb"
 	"github.com/psviderski/uncloud/internal/sshexec"
@@ -51,11 +52,10 @@ func New(configPath string, conn *config.MachineConnection) (*CLI, error) {
 }
 
 func (cli *CLI) CreateContext(name string) error {
-	if _, ok := cli.Config.Contexts[name]; ok {
-		return fmt.Errorf("context '%s' already exists", name)
-	}
-	cli.Config.Contexts[name] = &config.Context{
-		Name: name,
+	if _, ok := cli.Config.Contexts[name]; !ok {
+		cli.Config.Contexts[name] = &config.Context{
+			Name: name,
+		}
 	}
 	return cli.Config.Save()
 }
@@ -160,7 +160,7 @@ func (cli *CLI) InitCluster(ctx context.Context, opts InitClusterOptions) (*clie
 }
 
 func (cli *CLI) initRemoteMachine(ctx context.Context, opts InitClusterOptions) (*client.Client, error) {
-	contextName, err := cli.newContextName(opts.Context)
+	contextName, err := cli.newContextName(opts.Context, opts.RemoteMachine)
 	if err != nil {
 		return nil, err
 	}
@@ -226,11 +226,7 @@ func (cli *CLI) initRemoteMachine(ctx context.Context, opts InitClusterOptions) 
 	fmt.Printf("Current cluster context is now '%s'.\n", contextName)
 
 	// Save the machine's SSH connection details in the context config.
-	connCfg := config.MachineConnection{
-		SSH:        config.NewSSHDestination(opts.RemoteMachine.User, opts.RemoteMachine.Host, opts.RemoteMachine.Port),
-		SSHKeyFile: opts.RemoteMachine.KeyPath,
-	}
-	cli.Config.Contexts[contextName].Connections = append(cli.Config.Contexts[contextName].Connections, connCfg)
+	cli.addConnectionToContext(contextName, opts.RemoteMachine)
 	if err = cli.Config.Save(); err != nil {
 		return nil, fmt.Errorf("save config: %w", err)
 	}
@@ -239,12 +235,42 @@ func (cli *CLI) initRemoteMachine(ctx context.Context, opts InitClusterOptions) 
 
 // newContextName returns a unique name for a new cluster context. If the provided name is not DefaultContextName,
 // and it's already taken, an error is returned. If the name is not provided or is DefaultContextName, the first
-// available name "default[-N]" is returned.
-func (cli *CLI) newContextName(name string) (string, error) {
+// available name "default[-N]" is returned. if remote machine already exist in config it means we are resetting the machine
+func (cli *CLI) newContextName(name string, remoteMachine *RemoteMachine) (string, error) {
 	if name == "" {
 		name = DefaultContextName
 	}
 
+	// Normalize remote machine details
+	if remoteMachine != nil {
+		if remoteMachine.KeyPath == "" {
+			remoteMachine.KeyPath = DefaultSSHKeyPath
+		}
+	}
+
+	// Check if requested context exists and has matching connection
+	if _, exists := cli.Config.Contexts[name]; exists && remoteMachine != nil {
+		// Check if the existing context has a matching connection
+		for _, conn := range cli.Config.Contexts[name].Connections {
+			if cli.connectionsMatch(conn, remoteMachine) {
+				return name, nil // Reuse existing context with matching connection
+			}
+		}
+		// Context exists but with different connection
+		if name != DefaultContextName {
+			return "", fmt.Errorf("cluster context '%s' already exists with different connection", name)
+		}
+		// For default context, fall through to generate default-N
+	}
+
+	// Check for any existing context with matching connection (only for default context)
+	if name == DefaultContextName && remoteMachine != nil {
+		if existingContext := cli.findContextByConnection(remoteMachine); existingContext != "" {
+			return existingContext, nil
+		}
+	}
+
+	// Return the requested name if available
 	if _, exists := cli.Config.Contexts[name]; !exists {
 		return name, nil
 	}
@@ -261,6 +287,56 @@ func (cli *CLI) newContextName(name string) (string, error) {
 			return name, nil
 		}
 	}
+}
+
+// findContextByConnection returns the name of an existing context that has a connection matching the remote machine details.
+func (cli *CLI) findContextByConnection(remoteMachine *RemoteMachine) string {
+	for ctxName, ctx := range cli.Config.Contexts {
+		for _, conn := range ctx.Connections {
+			if cli.connectionsMatch(conn, remoteMachine) {
+				return ctxName
+			}
+		}
+	}
+	return ""
+}
+
+// connectionsMatch checks if a stored connection matches the remote machine details.
+func (cli *CLI) connectionsMatch(conn config.MachineConnection, remoteMachine *RemoteMachine) bool {
+	if conn.SSH == "" {
+		return false
+	}
+
+	user, host, port, err := conn.SSH.Parse()
+	if err != nil {
+		return false
+	}
+
+	// Expand home directory in both paths for consistent comparison
+	storedKeyPath := fs.ExpandHomeDir(conn.SSHKeyFile)
+	remoteKeyPath := fs.ExpandHomeDir(remoteMachine.KeyPath)
+
+	return user == remoteMachine.User &&
+		host == remoteMachine.Host &&
+		port == remoteMachine.Port &&
+		storedKeyPath == remoteKeyPath
+}
+
+// addConnectionToContext adds a connection to the specified context, avoiding duplicates.
+func (cli *CLI) addConnectionToContext(contextName string, remoteMachine *RemoteMachine) {
+	connCfg := config.MachineConnection{
+		SSH:        config.NewSSHDestination(remoteMachine.User, remoteMachine.Host, remoteMachine.Port),
+		SSHKeyFile: remoteMachine.KeyPath,
+	}
+
+	// Skip if connection already exists
+	for _, existingConn := range cli.Config.Contexts[contextName].Connections {
+		if cli.connectionsMatch(existingConn, remoteMachine) {
+			return
+		}
+	}
+
+	cli.Config.Contexts[contextName].Connections = append(cli.Config.Contexts[contextName].Connections, connCfg)
 }
 
 type AddMachineOptions struct {
